@@ -231,26 +231,66 @@ class IngestVdbOperator(AbstractOperator):
     def _supports_worker_write(self) -> bool:
         """Return whether ``ingest(return_results=False)`` writes this VDB from the Ray workers."""
 
-        return bool(getattr(self._vdb, "supports_worker_write", False)) and self._sidecar_spec is None
+        return bool(getattr(self._vdb, "supports_worker_write", False))
+
+    def _partition_writer(self, operator_kwargs: dict[str, Any]) -> Callable[[pd.DataFrame], dict[str, Any]]:
+        """Return a picklable ``frame -> receipt`` function that rebuilds this sink on a Ray worker.
+
+        The sidecar lookup built on the driver travels with the function, so write tasks do not
+        re-read the sidecar file.
+        """
+
+        operator_class = type(self)
+        kwargs = dict(operator_kwargs)
+        spec, lookup = self._sidecar_spec, self._sidecar_lookup
+        if spec is not None:
+            kwargs["vdb_kwargs"] = split_sidecar_from_vdb_kwargs(kwargs.get("vdb_kwargs"))[0]
+            spec = {key: value for key, value in spec.items() if key != "meta_dataframe"}
+
+        def write(frame: pd.DataFrame) -> dict[str, Any]:
+            operator = operator_class(**kwargs)
+            operator._sidecar_spec, operator._sidecar_lookup = spec, lookup
+            return operator._write_partition(frame)
+
+        return write
 
     def _write_partition(self, frame: pd.DataFrame) -> dict[str, Any]:
         """Ray-worker side of the worker-native sink: canonical projection of one block, written as Lance fragments."""
 
         tally = ConversionTally(embedding_column=self._embedding_column)
-        record_batches = iter_canonical_record_batches(
-            _iter_batch_rows_with_vectors([frame], embedding_column=self._embedding_column),
-            embedding_column=self._embedding_column,
-            tally=tally,
-        )
+        sidecar = self._sidecar_decorator()
         submitted_records = 0
 
-        def counted_batches() -> Iterator[CanonicalRecordBatch]:
-            nonlocal submitted_records
-            for batch in record_batches:
-                submitted_records += len(batch.records)
-                yield batch
+        if getattr(self._vdb, "supports_stream_ingest_batches", False):
+            record_batches = iter_canonical_record_batches(
+                _iter_batch_rows_with_vectors([frame], embedding_column=self._embedding_column),
+                embedding_column=self._embedding_column,
+                tally=tally,
+            )
 
-        receipt = self._vdb.write_partition(counted_batches())
+            def counted_batches() -> Iterator[CanonicalRecordBatch]:
+                nonlocal submitted_records
+                for batch in record_batches:
+                    if sidecar is not None:
+                        for record in batch.records:
+                            sidecar(record)
+                    submitted_records += len(batch.records)
+                    yield batch
+
+            receipt = self._vdb.write_partition(counted_batches())
+        else:
+            # Sparse tables carry no vector column, so they take the per-record projection.
+            records = _iter_client_vdb_records(
+                _iter_batch_rows([frame]), embedding_column=self._embedding_column, tally=tally
+            )
+
+            def counted_records() -> Iterator[dict[str, Any]]:
+                nonlocal submitted_records
+                for record in records:
+                    submitted_records += 1
+                    yield record if sidecar is None else sidecar(record)
+
+            receipt = self._vdb.write_partition_records(counted_records())
         receipt["submitted_records"] = submitted_records
         # The fail-closed rules (no row converted, searchable rows without embeddings) are
         # decided over the whole upload in ``_commit_partitions``, not per partition.

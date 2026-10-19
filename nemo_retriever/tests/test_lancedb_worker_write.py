@@ -106,9 +106,9 @@ def test_worker_write_without_partitions_creates_no_table(tmp_path: Path) -> Non
     assert "chunks" not in lancedb.connect(str(tmp_path / "db")).list_tables().tables
 
 
-def test_worker_write_is_the_default_for_dense_local_tables(tmp_path: Path) -> None:
+def test_worker_write_is_the_default_for_local_tables(tmp_path: Path) -> None:
     assert _backend(tmp_path / "db").supports_worker_write
-    assert not _backend(tmp_path / "db", sparse=True).supports_worker_write
+    assert _backend(tmp_path / "db", sparse=True).supports_worker_write
     assert _backend(tmp_path / "db", stream_operation_id="job-1").supports_worker_write
 
 
@@ -357,3 +357,51 @@ def test_worker_write_operation_id_resumes_after_finalization_failure(tmp_path: 
     monkeypatch.setattr(LanceDB, "_finalize_stream_write", original)
     _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-2"), frames)
     assert _rows(uri).num_rows == 5
+
+
+def test_worker_write_applies_sidecar_metadata_like_the_stream(tmp_path: Path) -> None:
+    sidecar = tmp_path / "sidecar.csv"
+    pd.DataFrame({"source": ["/tmp/doc-0.pdf", "/tmp/doc-1.pdf"], "team": ["alpha", "beta"]}).to_csv(
+        sidecar, index=False
+    )
+    frames = _frames([_row(index) for index in range(5)], batch_size=2)
+
+    def vdb_kwargs(name: str) -> dict[str, Any]:
+        return {
+            "uri": str(tmp_path / name),
+            "table_name": "chunks",
+            "vector_dim": DIM,
+            "build_index": False,
+            "meta_dataframe": str(sidecar),
+            "meta_source_field": "source",
+            "meta_fields": ["team"],
+        }
+
+    IngestVdbOperator(vdb_op="lancedb", vdb_kwargs=vdb_kwargs("stream"))._stream_ingest(iter(frames))
+    kwargs = {"vdb_op": "lancedb", "vdb_kwargs": vdb_kwargs("worker")}
+    operator = IngestVdbOperator(**kwargs)
+    assert operator._supports_worker_write()
+    write = operator._partition_writer(kwargs)
+    sidecar.unlink()  # The write tasks use the driver's lookup, not the file.
+    assert operator._commit_partitions([write(frame) for frame in frames]) == 5
+
+    expected, actual = _rows(tmp_path / "stream"), _rows(tmp_path / "worker")
+    assert actual.equals(expected)
+    assert any('"team":"alpha"' in value for value in actual.column("metadata").to_pylist())
+
+
+def test_worker_write_sparse_table_matches_the_stream(tmp_path: Path) -> None:
+    frames = _frames([_row(0), _row(1, text=""), *(_row(index) for index in range(2, 6))], batch_size=2)
+    stream_backend = _backend(tmp_path / "stream", sparse=True, vector_dim=None)
+    assert not stream_backend.supports_stream_ingest_batches
+    stream_submitted = IngestVdbOperator(vdb=stream_backend)._stream_ingest(iter(frames))
+
+    worker_backend = _backend(tmp_path / "worker", sparse=True, vector_dim=None)
+    assert worker_backend.supports_worker_write
+    assert _worker_write(worker_backend, frames) == stream_submitted
+
+    expected, actual = _rows(tmp_path / "stream"), _rows(tmp_path / "worker")
+    assert "vector" not in actual.schema.names
+    assert actual.schema.equals(expected.schema, check_metadata=True)
+    assert actual.equals(expected)
+    assert actual.num_rows == 5

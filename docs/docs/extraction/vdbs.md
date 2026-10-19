@@ -338,7 +338,7 @@ records after a known commit and finalization failure.
 These settings apply only to `LanceDB.stream_ingest()`. Legacy `run()` calls
 reject non-default streaming settings instead of ignoring them.
 
-When you call `ingest(return_results=False)` on a local, dense (non-sparse)
+When you call `ingest(return_results=False)` on a local
 LanceDB table, the Ray workers write the table. Each Ray write task projects one
 block and writes it as Lance fragments with the same page layout as the streaming
 writer. The driver receives only fragment receipts, commits one table version, and
@@ -355,8 +355,12 @@ streaming path. The digest combines row hashes from every write task, so it does
 not depend on how Ray partitions the rows. A retry that finds the operation
 already committed deletes its own fragments instead of appending them again.
 
-The driver streaming path still runs with sidecar metadata, sparse tables,
-remote stores, and `ingest(return_results=True)`.
+Sparse (full-text only) tables and sidecar metadata use the same worker writes.
+The sidecar file is read once on the driver, and its lookup is sent to the
+write tasks.
+
+The driver streaming path still runs for remote stores and
+`ingest(return_results=True)`.
 
 `RayDataExecutor.build_dataset()` remains lazy and builds the complete legacy
 graph, including the global VDB stage. In-process and service execution do not

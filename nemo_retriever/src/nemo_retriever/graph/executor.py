@@ -765,14 +765,14 @@ class RayDataExecutor(AbstractExecutor):
         import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-        operator_class, operator_kwargs = sink_node.operator_class, sink_node.operator_kwargs
+        partition_writer = sink_node.operator._partition_writer(sink_node.operator_kwargs)
         rows_per_task = int(sink_node.operator._vdb.worker_write_rows)
 
         def write_partition(block: pa.Table | pd.DataFrame) -> pd.DataFrame:
             frame = block if isinstance(block, pd.DataFrame) else arrow_table_to_pandas(block)
             if validate_batch is not None:
                 validate_batch(frame)
-            receipt = operator_class(**operator_kwargs)._write_partition(frame)
+            receipt = partition_writer(frame)
             receipt["fragments"] = json.dumps(receipt["fragments"])
             receipt["conversion"] = json.dumps(receipt["conversion"])
             receipt["input_rows"] = len(frame)

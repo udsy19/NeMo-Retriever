@@ -982,7 +982,7 @@ class LanceDB(VDB):
         self.worker_write_rows = int(worker_write_rows)
         if self.worker_write_rows < 1:
             raise ValueError(f"worker_write_rows must be a positive integer, got {worker_write_rows!r}")
-        self.supports_worker_write = self.supports_stream_ingest_batches
+        self.supports_worker_write = self.supports_stream_ingest
         self._service_table_schema = service_table_schema
         self._service_index_mode = str(service_index_mode) if service_index_mode is not None else None
         self._writes_since_optimize = 0
@@ -2023,10 +2023,17 @@ class LanceDB(VDB):
         the row tallies ``commit_partitions`` needs.
         """
 
+        return self._write_partition_source(_BatchStreamSource(self, batches))
+
+    def write_partition_records(self, records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+        """``write_partition`` for canonical record dictionaries, as ``stream_ingest`` takes them (sparse tables)."""
+
+        return self._write_partition_source(_RecordStreamSource(self, records))
+
+    def _write_partition_source(self, source: _StreamSource) -> dict[str, Any]:
         import lance.fragment
 
         stats = _StreamStats(vector_dim=self.vector_dim)
-        source = _BatchStreamSource(self, batches)
         receipt: dict[str, Any] = {"fragments": [], "rows_written": 0, "client_records": 0, "vector_dim": 0}
         if not source.open(stats):
             receipt["client_records"] = stats.client_records

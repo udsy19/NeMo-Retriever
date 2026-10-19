@@ -517,14 +517,17 @@ def _iter_client_vdb_records(
     rows: Iterable[dict[str, Any]],
     *,
     embedding_column: str = "embedding",
+    tally: ConversionTally | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Lazily convert graph rows into individual canonical NRL records.
 
     Rows without searchable content are skipped. Missing embeddings fail the
-    stream on exhaustion, matching :func:`to_client_vdb_records`.
+    stream on exhaustion, matching :func:`to_client_vdb_records`. A caller that
+    passes ``tally`` applies the fail-closed rules itself, over every partition.
     """
 
-    tally = ConversionTally(embedding_column=embedding_column)
+    owns_tally = tally is None
+    tally = tally or ConversionTally(embedding_column=embedding_column)
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -536,7 +539,8 @@ def _iter_client_vdb_records(
             continue
         embedding = _embedding_from_graph_row(row, embedding_column=embedding_column)
         tally.reject(row, has_embedding=embedding is not None)
-    tally.finish()
+    if owns_tally:
+        tally.finish()
 
 
 @dataclass(frozen=True, slots=True)
