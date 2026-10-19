@@ -16,6 +16,7 @@ import pyarrow as pa
 from nemo_retriever.common.vdb.adt_vdb import CollectionWriteContext, UnsupportedVDBOperation, VDB
 from nemo_retriever.common.vdb.factory import get_vdb_op_cls
 from nemo_retriever.common.vdb.records import (
+    VdbUploadError,
     CanonicalRecordBatch,
     ConversionTally,
     _iter_client_vdb_records,
@@ -273,7 +274,7 @@ class IngestVdbOperator(AbstractOperator):
             tally.absorb(receipt["conversion"])
         try:
             tally.finish()
-        except Exception:
+        except VdbUploadError:
             self._vdb.discard_partitions(receipts)
             raise
         self._vdb.commit_partitions(receipts)

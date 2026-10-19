@@ -458,6 +458,7 @@ class ConversionTally:
         self._missing_embeddings = 0
 
     def reject(self, row: dict[str, Any], *, has_embedding: bool) -> None:
+        """Count one graph row that produced no record, by reason (stage error, missing embedding, no content)."""
         missing_embedding = not has_embedding and _row_has_uploadable_content_without_embedding(row, None)
         if missing_embedding:
             self._missing_embeddings += 1
@@ -491,6 +492,12 @@ class ConversionTally:
         self._missing_embeddings += int(snapshot["missing_embeddings"])
 
     def finish(self) -> None:
+        """Apply the fail-closed rules to the counts so far.
+
+        Raises:
+            VdbUploadError: searchable rows are missing embeddings while other rows converted, or rows
+                arrived and none of them converted.
+        """
         if self.converted_count and self._missing_embeddings:
             raise VdbUploadError(
                 "vdb_upload is refusing a partial write because searchable rows are missing embeddings: "

@@ -2087,10 +2087,14 @@ class LanceDB(VDB):
         progress = {"commit_attempted": False}
         try:
             self._commit_worker_partitions(receipts, progress)
-        except Exception:
+        except Exception as exc:
             # Before the commit nothing references the fragments, so a rejected upload removes them.
             # Once the commit was attempted, the files may belong to a table version: keep them.
             if not progress["commit_attempted"]:
+                # Type only: validation errors can quote row content; the caller gets the full exception.
+                logger.error(
+                    "Worker-write upload rejected before commit (%s); removing its fragments.", type(exc).__name__
+                )
                 self.discard_partitions(receipts)
             raise
 
