@@ -915,7 +915,6 @@ class LanceDB(VDB):
         stream_batch_bytes: int = _DEFAULT_STREAM_BATCH_BYTES,
         stream_optimize: bool = False,
         stream_operation_id: str | None = None,
-        worker_write: bool = False,
         worker_write_rows: int = 8192,
         **kwargs,
     ):
@@ -966,25 +965,12 @@ class LanceDB(VDB):
         )
         # Sparse tables store no vector, so they keep the record stream.
         self.supports_stream_ingest_batches = self.supports_stream_ingest and not self.sparse
-        # Opt-in worker-native sink: Ray workers project + write Lance fragments
-        # (``write_partition``), the driver commits once (``commit_partitions``).
-        # Dense local tables only; ``worker_write_rows`` bounds rows per write task.
-        self.worker_write = bool(worker_write)
+        # Worker-native sink: Ray workers project + write Lance fragments (``write_partition``),
+        # the driver commits once (``commit_partitions``). ``worker_write_rows`` bounds rows per write task.
         self.worker_write_rows = int(worker_write_rows)
         if self.worker_write_rows < 1:
             raise ValueError(f"worker_write_rows must be a positive integer, got {worker_write_rows!r}")
-        if self.worker_write and not self.supports_stream_ingest_batches:
-            raise ValueError("worker_write=True requires a dense (non-sparse) local LanceDB table")
-        if self.worker_write and self.stream_operation_id is not None:
-            raise ValueError(
-                "worker_write=True does not support stream_operation_id: the worker path keeps no durable "
-                "recovery markers, so an operation-ID retry would append the rows again"
-            )
-        if self.worker_write and self.vector_dim is None:
-            raise ValueError(
-                "worker_write=True requires an explicit vector_dim: each write task would otherwise infer "
-                "the width from its own first vector"
-            )
+        self.supports_worker_write = self.supports_stream_ingest_batches and self.stream_operation_id is None
         self._service_table_schema = service_table_schema
         self._service_index_mode = str(service_index_mode) if service_index_mode is not None else None
         self._writes_since_optimize = 0

@@ -71,7 +71,7 @@ def test_worker_write_matches_columnar_stream(tmp_path: Path) -> None:
     assert stream_backend.supports_stream_ingest_batches
     stream_submitted = IngestVdbOperator(vdb=stream_backend)._stream_ingest(iter(frames))
 
-    worker_backend = _backend(tmp_path / "worker", worker_write=True)
+    worker_backend = _backend(tmp_path / "worker")
     worker_submitted = _worker_write(worker_backend, frames)
 
     assert worker_submitted == stream_submitted == 6
@@ -91,23 +91,24 @@ def test_worker_write_overwrite_then_append(tmp_path: Path) -> None:
     frames = _frames([_row(index) for index in range(5)], batch_size=3)
     uri = tmp_path / "db"
 
-    assert _worker_write(_backend(uri, worker_write=True), frames) == 5
-    assert _worker_write(_backend(uri, worker_write=True), frames) == 5
+    assert _worker_write(_backend(uri), frames) == 5
+    assert _worker_write(_backend(uri), frames) == 5
     assert _rows(uri).num_rows == 5
 
-    assert _worker_write(_backend(uri, worker_write=True, overwrite=False), frames) == 5
+    assert _worker_write(_backend(uri, overwrite=False), frames) == 5
     assert _rows(uri).num_rows == 10
 
 
 def test_worker_write_without_partitions_creates_no_table(tmp_path: Path) -> None:
-    backend = _backend(tmp_path / "db", worker_write=True)
+    backend = _backend(tmp_path / "db")
     assert IngestVdbOperator(vdb=backend)._commit_partitions([]) == 0
     assert "chunks" not in lancedb.connect(str(tmp_path / "db")).list_tables().tables
 
 
-def test_worker_write_requires_dense_table(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="worker_write"):
-        _backend(tmp_path / "db", worker_write=True, sparse=True)
+def test_worker_write_is_the_default_for_dense_local_tables(tmp_path: Path) -> None:
+    assert _backend(tmp_path / "db").supports_worker_write
+    assert not _backend(tmp_path / "db", sparse=True).supports_worker_write
+    assert not _backend(tmp_path / "db", stream_operation_id="job-1").supports_worker_write
 
 
 def _vector_pages(uri: Path) -> list[tuple[int, int]]:
@@ -128,7 +129,7 @@ def _max_rows_per_page(layout: list[tuple[int, int]]) -> int:
 
 def test_worker_write_hybrid_builds_fts_index(tmp_path: Path) -> None:
     rows = [_row(index) for index in range(40)]
-    backend = _backend(tmp_path / "db", worker_write=True, hybrid=True, build_index=True)
+    backend = _backend(tmp_path / "db", hybrid=True, build_index=True)
     assert _worker_write(backend, _frames(rows, batch_size=16)) == 40
 
     table = lancedb.connect(str(tmp_path / "db")).open_table("chunks")
@@ -156,7 +157,7 @@ def test_optimize_keeps_vector_page_size(tmp_path: Path) -> None:
     dim, count = 2048, 3 * _LANCE_ROWS_PER_PAGE
     uri = tmp_path / "db"
     frames = _wide_frames(count, dim=dim, batch_size=count // 2)
-    assert _worker_write(_backend(uri, worker_write=True, vector_dim=dim), frames) == count
+    assert _worker_write(_backend(uri, vector_dim=dim), frames) == count
     before = _vector_pages(uri)
     assert len(before) == 2 and _max_rows_per_page(before) <= _LANCE_ROWS_PER_PAGE, before
 
@@ -175,16 +176,26 @@ def _unsearchable_row(row_id: int) -> dict[str, Any]:
     return row
 
 
-def test_worker_write_rejects_options_it_cannot_honor(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="stream_operation_id"):
-        _backend(tmp_path / "db", worker_write=True, stream_operation_id="job-1")
-    with pytest.raises(ValueError, match="vector_dim"):
-        _backend(tmp_path / "db", worker_write=True, vector_dim=None)
+def test_worker_write_infers_vector_dim_and_rejects_disagreeing_partitions(tmp_path: Path) -> None:
+    uri = tmp_path / "db"
+    assert (
+        _worker_write(_backend(uri, vector_dim=None), _frames([_row(index) for index in range(4)], batch_size=2)) == 4
+    )
+    assert _rows(uri).schema.field("vector").type.list_size == DIM
+
+    short = _row(9)
+    short["embedding"] = short["embedding"][:-1]
+    with pytest.raises(ValueError, match="disagree on vector_dim"):
+        _worker_write(
+            _backend(tmp_path / "other", vector_dim=None),
+            _frames([_row(1)], batch_size=1) + _frames([short], batch_size=1),
+        )
+    assert not list((tmp_path / "other" / "chunks.lance" / "data").glob("*"))
 
 
 def test_worker_write_finalization_failure_reports_committed_data(tmp_path: Path, monkeypatch) -> None:
     uri = tmp_path / "db"
-    backend = _backend(uri, worker_write=True)
+    backend = _backend(uri)
 
     def failing_finalize(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("index build failed")
@@ -198,7 +209,7 @@ def test_worker_write_finalization_failure_reports_committed_data(tmp_path: Path
 def test_worker_write_skips_unsearchable_partition_when_others_have_rows(tmp_path: Path) -> None:
     uri = tmp_path / "db"
     frames = _frames([_unsearchable_row(0), _unsearchable_row(1), _row(2), _row(3)], batch_size=2)
-    assert _worker_write(_backend(uri, worker_write=True), frames) == 2
+    assert _worker_write(_backend(uri), frames) == 2
     assert _rows(uri)["text"].to_pylist() == ["chunk 2", "chunk 3"]
 
 
@@ -206,13 +217,13 @@ def test_worker_write_applies_fail_closed_rules_over_the_whole_upload(tmp_path: 
     uri = tmp_path / "db"
     only_unsearchable = _frames([_unsearchable_row(0), _unsearchable_row(1)], batch_size=1)
     with pytest.raises(VdbUploadError):
-        _worker_write(_backend(uri, worker_write=True), only_unsearchable)
+        _worker_write(_backend(uri), only_unsearchable)
 
     missing = _row(0)
     missing["embedding"] = None
     partial = _frames([missing, _row(1)], batch_size=1)
     with pytest.raises(VdbUploadError, match="missing embeddings"):
-        _worker_write(_backend(uri, worker_write=True), partial)
+        _worker_write(_backend(uri), partial)
     # Fragments may be on disk, but nothing was committed: no manifest exists.
     assert not list((uri / "chunks.lance").glob("_versions/*.manifest"))
 
@@ -224,7 +235,7 @@ def _data_files(uri: Path) -> list[Path]:
 def test_worker_write_rows_must_be_positive(tmp_path: Path) -> None:
     for rows in (0, -1):
         with pytest.raises(ValueError, match="worker_write_rows"):
-            _backend(tmp_path / "db", worker_write=True, worker_write_rows=rows)
+            _backend(tmp_path / "db", worker_write_rows=rows)
 
 
 def test_rejected_upload_removes_its_fragment_files(tmp_path: Path) -> None:
@@ -232,16 +243,16 @@ def test_rejected_upload_removes_its_fragment_files(tmp_path: Path) -> None:
     missing = _row(0)
     missing["embedding"] = None
     with pytest.raises(VdbUploadError, match="missing embeddings"):
-        _worker_write(_backend(uri, worker_write=True), _frames([_row(1), _row(2), missing], batch_size=2))
+        _worker_write(_backend(uri), _frames([_row(1), _row(2), missing], batch_size=2))
     assert _data_files(uri) == []
 
 
 def test_rejected_append_keeps_committed_files_and_removes_its_own(tmp_path: Path) -> None:
     uri = tmp_path / "db"
-    first = _backend(uri, worker_write=True, embedding_model_name="model-a")
+    first = _backend(uri, embedding_model_name="model-a")
     _worker_write(first, _frames([_row(index) for index in range(4)], batch_size=2))
     committed = _data_files(uri)
-    append = _backend(uri, worker_write=True, overwrite=False, embedding_model_name="another-model")
+    append = _backend(uri, overwrite=False, embedding_model_name="another-model")
     with pytest.raises(ValueError, match="model"):
         _worker_write(append, _frames([_row(index) for index in range(4, 8)], batch_size=2))
     assert _data_files(uri) == committed
@@ -272,7 +283,7 @@ def test_executor_worker_write_batch_format_and_driver_node(
     from nemo_retriever.graph.pipeline_graph import Node
 
     vdb_kwargs = {"uri": str(tmp_path / "db"), "table_name": "chunks", "vector_dim": DIM, "build_index": False}
-    vdb_kwargs.update(worker_write=True, worker_write_rows=3)
+    vdb_kwargs.update(worker_write_rows=3)
     node = Node(IngestVdbOperator(vdb_op="lancedb", vdb_kwargs=vdb_kwargs))
     dataset = _RecordingDataset([pd.DataFrame([_row(index) for index in range(3)])])
     driver_node = "a" * 56

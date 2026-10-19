@@ -229,18 +229,12 @@ class IngestVdbOperator(AbstractOperator):
         return submitted_records
 
     def _supports_worker_write(self) -> bool:
-        """Return whether the opt-in worker-native fragment sink (``worker_write``) applies to this VDB."""
+        """Return whether ``ingest(return_results=False)`` writes this VDB from the Ray workers."""
 
-        if not getattr(self._vdb, "worker_write", False):
-            return False
-        if not getattr(self._vdb, "supports_stream_ingest_batches", False):
-            raise UnsupportedVDBOperation(f"{type(self._vdb).__name__} does not support worker_write")
-        if self._sidecar_spec is not None:
-            raise UnsupportedVDBOperation("worker_write does not support vdb sidecar metadata")
-        return True
+        return bool(getattr(self._vdb, "supports_worker_write", False)) and self._sidecar_spec is None
 
     def _write_partition(self, frame: pd.DataFrame) -> dict[str, Any]:
-        """Ray-worker side of worker_write: canonical projection of one block, written as Lance fragments."""
+        """Ray-worker side of the worker-native sink: canonical projection of one block, written as Lance fragments."""
 
         tally = ConversionTally(embedding_column=self._embedding_column)
         record_batches = iter_canonical_record_batches(
@@ -264,7 +258,7 @@ class IngestVdbOperator(AbstractOperator):
         return receipt
 
     def _commit_partitions(self, receipts: list[dict[str, Any]]) -> int:
-        """Driver side of worker_write: commit every receipt in one Lance version; return submitted records.
+        """Driver side of the worker-native sink: commit every receipt in one Lance version; return submitted records.
 
         Applies the stream path's conversion rules once, over all partitions, before anything is committed.
         """
