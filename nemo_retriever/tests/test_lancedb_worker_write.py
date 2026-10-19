@@ -271,7 +271,7 @@ class _RecordingDataset:
         outputs = [
             fn(frame if options["batch_format"] == "pandas" else pa.Table.from_pandas(frame)) for frame in self.frames
         ]
-        return SimpleNamespace(take_all=lambda: [row for out in outputs for row in out.to_dict("records")])
+        return SimpleNamespace(iter_rows=lambda: iter([row for out in outputs for row in out.to_dict("records")]))
 
 
 @pytest.mark.parametrize("preserve, batch_format", [(True, "pandas"), (False, "pyarrow")])
@@ -296,3 +296,30 @@ def test_executor_worker_write_batch_format_and_driver_node(
     strategy = dataset.options["scheduling_strategy"]
     assert (strategy.node_id, strategy.soft) == (driver_node, False)
     assert result["submitted_records"].tolist() == [3]
+
+
+def test_executor_removes_finished_fragments_when_a_write_task_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ray = pytest.importorskip("ray")
+    from nemo_retriever.graph.executor import RayDataExecutor
+    from nemo_retriever.graph.pipeline_graph import Node
+
+    class _FailingDataset(_RecordingDataset):
+        def map_batches(self, fn, **options):
+            finished = super().map_batches(fn, **options)
+
+            def rows():
+                yield from finished.iter_rows()
+                raise RuntimeError("write task failed")
+
+            return SimpleNamespace(iter_rows=rows)
+
+    uri = tmp_path / "db"
+    vdb_kwargs = {"uri": str(uri), "table_name": "chunks", "vector_dim": DIM, "build_index": False}
+    node = Node(IngestVdbOperator(vdb_op="lancedb", vdb_kwargs=vdb_kwargs))
+    dataset = _FailingDataset(_frames([_row(index) for index in range(4)], batch_size=2))
+    monkeypatch.setattr(ray, "get_runtime_context", lambda: SimpleNamespace(get_node_id=lambda: "a" * 56))
+    with pytest.raises(RuntimeError, match="write task failed"):
+        RayDataExecutor.__new__(RayDataExecutor)._worker_write_ingest(dataset, node)
+    assert not list((uri / "chunks.lance" / "data").glob("*"))

@@ -778,7 +778,7 @@ class RayDataExecutor(AbstractExecutor):
             receipt["input_rows"] = len(frame)
             return pd.DataFrame([receipt])
 
-        receipt_rows = dataset.map_batches(
+        written = dataset.map_batches(
             write_partition,
             batch_format="pandas" if preserve_pandas_blocks else "pyarrow",
             batch_size=rows_per_task,
@@ -786,11 +786,22 @@ class RayDataExecutor(AbstractExecutor):
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(), soft=False
             ),
-        ).take_all()
-        receipts = [
-            {**row, "fragments": json.loads(row["fragments"]), "conversion": json.loads(row["conversion"])}
-            for row in receipt_rows
-        ]
+        )
+        receipts: list[dict[str, Any]] = []
+        try:
+            for row in written.iter_rows():
+                receipts.append(
+                    {**row, "fragments": json.loads(row["fragments"]), "conversion": json.loads(row["conversion"])}
+                )
+        except Exception as exc:
+            # Type only: a stage error can quote row content; the caller gets the full exception.
+            logger.error(
+                "Worker write task failed (%s); removing the fragments of %d finished tasks.",
+                type(exc).__name__,
+                len(receipts),
+            )
+            sink_node.operator._vdb.discard_partitions(receipts)
+            raise
         submitted_records = sink_node.operator._commit_partitions(receipts)
         input_rows = sum(int(receipt["input_rows"]) for receipt in receipts)
         return pd.DataFrame([{"input_rows": input_rows, "submitted_records": submitted_records}])
