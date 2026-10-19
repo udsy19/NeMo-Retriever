@@ -343,8 +343,9 @@ LanceDB table, the Ray workers write the table. Each Ray write task projects one
 block and writes it as Lance fragments with the same page layout as the streaming
 writer. The driver receives only fragment receipts, commits one table version, and
 then runs the same index build and validation as the streaming path. Hybrid tables
-get their full-text index in that step. When `vector_dim` is `None`, each write
-task infers the width, and the commit fails when the tasks disagree.
+get their full-text index in that step. When `vector_dim` is `None`, an append
+uses the width of the existing table. For a new table, each write task infers the
+width, and the commit fails when the tasks disagree.
 Write tasks run on the Ray node of the driver, because the driver commit reads the
 fragments from the local table path. If the upload is rejected before the commit,
 for example because searchable rows have no embeddings, the fragment files that

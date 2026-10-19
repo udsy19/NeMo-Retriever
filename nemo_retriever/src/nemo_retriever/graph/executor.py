@@ -765,7 +765,7 @@ class RayDataExecutor(AbstractExecutor):
         import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-        partition_writer = sink_node.operator._partition_writer(sink_node.operator_kwargs)
+        partition_writer = sink_node.operator._partition_writer()
         rows_per_task = int(sink_node.operator._vdb.worker_write_rows)
 
         def write_partition(block: pa.Table | pd.DataFrame) -> pd.DataFrame:

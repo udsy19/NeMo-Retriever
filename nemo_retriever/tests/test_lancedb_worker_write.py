@@ -381,7 +381,7 @@ def test_worker_write_applies_sidecar_metadata_like_the_stream(tmp_path: Path) -
     kwargs = {"vdb_op": "lancedb", "vdb_kwargs": vdb_kwargs("worker")}
     operator = IngestVdbOperator(**kwargs)
     assert operator._supports_worker_write()
-    write = operator._partition_writer(kwargs)
+    write = operator._partition_writer()
     sidecar.unlink()  # The write tasks use the driver's lookup, not the file.
     assert operator._commit_partitions([write(frame) for frame in frames]) == 5
 
@@ -434,3 +434,38 @@ def test_return_results_writes_from_workers_and_returns_the_rows(monkeypatch: py
 
     assert calls == ["materialize", "write"]
     assert result["read"].tolist() == ["materialized"]
+
+
+def test_worker_write_operation_id_empty_retry_cannot_skip_finalization(tmp_path: Path, monkeypatch) -> None:
+    uri = tmp_path / "db"
+    _worker_write(_backend(uri, overwrite=False), _frames([_row(100)], batch_size=1))
+    monkeypatch.setattr(LanceDB, "_finalize_stream_write", lambda self, **kwargs: (_ for _ in ()).throw(OSError("x")))
+    with pytest.raises(DataCommittedFinalizationError):
+        _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-3"), _frames([_row(0)], batch_size=1))
+    monkeypatch.undo()
+    with pytest.raises(VdbOperationConflict):
+        _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-3"), [])
+
+
+def test_worker_write_ships_a_supplied_backend_to_the_tasks(tmp_path: Path) -> None:
+    cloudpickle = pytest.importorskip("cloudpickle")
+    operator = IngestVdbOperator(vdb=_backend(tmp_path / "db"))
+    write = cloudpickle.loads(cloudpickle.dumps(operator._partition_writer()))
+    frames = _frames([_row(index) for index in range(5)], batch_size=2)
+    assert operator._commit_partitions([write(frame) for frame in frames]) == 5
+    assert _rows(tmp_path / "db").num_rows == 5
+
+
+def test_worker_append_without_vector_dim_takes_the_table_width(tmp_path: Path) -> None:
+    short = {**_row(0), "embedding": [0.5, 0.5, 0.5]}
+    frames = _frames([short, _row(1), _row(2)], batch_size=3)
+    for name in ("stream", "worker"):
+        _worker_write(_backend(tmp_path / name), _frames([_row(100)], batch_size=1))
+
+    stream = IngestVdbOperator(vdb=_backend(tmp_path / "stream", overwrite=False, vector_dim=None))
+    stream_submitted = stream._stream_ingest(iter(frames))
+    operator = IngestVdbOperator(vdb=_backend(tmp_path / "worker", overwrite=False, vector_dim=None))
+    write = operator._partition_writer()
+    assert operator._commit_partitions([write(frame) for frame in frames]) == stream_submitted
+
+    assert _rows(tmp_path / "worker").equals(_rows(tmp_path / "stream"))

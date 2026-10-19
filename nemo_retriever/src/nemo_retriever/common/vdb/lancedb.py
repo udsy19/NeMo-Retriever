@@ -2,6 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import functools
 import hashlib
 import json
@@ -16,7 +17,7 @@ from datetime import datetime, timezone
 from itertools import chain
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Final, FrozenSet
+from typing import Any, Callable, Final, FrozenSet
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -888,6 +889,16 @@ class _BatchStreamSource(_StreamSource):
             stats=stats,
             include_digest=include_digest,
         )
+
+
+_PROCESS_LOCAL_LOCKS: dict[str, Callable[[], Any]] = {
+    "_collection_store_lock": threading.Lock,
+    "_connection_lock": threading.RLock,
+    "_write_lock": threading.Lock,
+    "_stream_lock": threading.Lock,
+    "_index_lock": threading.Lock,
+    "_index_generation_lock": threading.Lock,
+}
 
 
 @functools.lru_cache(maxsize=1)
@@ -1991,6 +2002,38 @@ class LanceDB(VDB):
         self._remember_table(self.table_name, existing_table)
         return None
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Settings only: locks and open LanceDB handles stay in the process that created them."""
+
+        state = dict(self.__dict__)
+        for name in _PROCESS_LOCAL_LOCKS:
+            state.pop(name, None)
+        state.update(_connections={}, _opened_tables={}, _collection_store=None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        for name, lock_type in _PROCESS_LOCAL_LOCKS.items():
+            setattr(self, name, lock_type())
+
+    def _worker_copy(self) -> "LanceDB":
+        """Copy of this backend for Ray write tasks.
+
+        An append with ``vector_dim=None`` takes the existing table's width, as the stream path does,
+        so a task does not infer its width from its own first vector.
+        """
+
+        worker = copy.copy(self)
+        if worker.vector_dim is None and not worker.overwrite and not worker.sparse:
+            try:
+                table = lancedb.connect(uri=self.uri).open_table(self.table_name)
+            except ValueError as exc:
+                if not _is_missing_lancedb_table_error(exc):
+                    raise
+            else:
+                worker.vector_dim = _schema_vector_dim(_table_schema(table))
+        return worker
+
     def _lance_table_uri(self) -> str:
         path = _filesystem_lancedb_path(self.uri)
         if path is None:
@@ -2149,6 +2192,8 @@ class LanceDB(VDB):
                         stats.vector_dim = _schema_vector_dim(_table_schema(existing_table))
             if stats.client_records == 0:
                 # Same as the stream path: nothing to write, and no table is created.
+                if operation_id is not None:
+                    _reject_empty_operation_bypass(existing_table, operation_id=operation_id)
                 if existing_table is not None:
                     self._remember_table(self.table_name, existing_table)
                 return

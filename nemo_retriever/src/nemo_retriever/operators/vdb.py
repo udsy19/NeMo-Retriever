@@ -233,22 +233,21 @@ class IngestVdbOperator(AbstractOperator):
 
         return bool(getattr(self._vdb, "supports_worker_write", False))
 
-    def _partition_writer(self, operator_kwargs: dict[str, Any]) -> Callable[[pd.DataFrame], dict[str, Any]]:
-        """Return a picklable ``frame -> receipt`` function that rebuilds this sink on a Ray worker.
+    def _partition_writer(self) -> Callable[[pd.DataFrame], dict[str, Any]]:
+        """Return a picklable ``frame -> receipt`` function for Ray write tasks.
 
-        The sidecar lookup built on the driver travels with the function, so write tasks do not
-        re-read the sidecar file.
+        It carries a settings-only copy of this sink's backend and the sidecar lookup built on the
+        driver, so write tasks do not re-read the sidecar file.
         """
 
-        operator_class = type(self)
-        kwargs = dict(operator_kwargs)
+        operator_class, embedding_column = type(self), self._embedding_column
+        vdb = self._vdb._worker_copy()
         spec, lookup = self._sidecar_spec, self._sidecar_lookup
         if spec is not None:
-            kwargs["vdb_kwargs"] = split_sidecar_from_vdb_kwargs(kwargs.get("vdb_kwargs"))[0]
             spec = {key: value for key, value in spec.items() if key != "meta_dataframe"}
 
         def write(frame: pd.DataFrame) -> dict[str, Any]:
-            operator = operator_class(**kwargs)
+            operator = operator_class(vdb=vdb, embedding_column=embedding_column)
             operator._sidecar_spec, operator._sidecar_lookup = spec, lookup
             return operator._write_partition(frame)
 
