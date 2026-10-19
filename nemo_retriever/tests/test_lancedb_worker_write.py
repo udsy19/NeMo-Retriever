@@ -469,3 +469,23 @@ def test_worker_append_without_vector_dim_takes_the_table_width(tmp_path: Path) 
     assert operator._commit_partitions([write(frame) for frame in frames]) == stream_submitted
 
     assert _rows(tmp_path / "worker").equals(_rows(tmp_path / "stream"))
+
+
+def test_worker_append_with_every_row_dropped_keeps_the_table_version(tmp_path: Path) -> None:
+    bad = {**_row(5), "embedding": [float("nan")] * DIM}
+    frames = _frames([bad], batch_size=1)
+    versions = {}
+    for name in ("stream", "worker"):
+        _worker_write(_backend(tmp_path / name), _frames([_row(100)], batch_size=1))
+        backend = _backend(tmp_path / name, overwrite=False, on_bad_vectors="drop", validate_vector_length=False)
+        before = lancedb.connect(str(tmp_path / name)).open_table("chunks").version
+        files_before = _data_files(tmp_path / name)
+        if name == "stream":
+            IngestVdbOperator(vdb=backend)._stream_ingest(iter(frames))
+        else:
+            _worker_write(backend, frames)
+        versions[name] = lancedb.connect(str(tmp_path / name)).open_table("chunks").version - before
+        assert _data_files(tmp_path / name) == files_before
+
+    assert versions == {"stream": 0, "worker": 0}
+    assert _rows(tmp_path / "worker").equals(_rows(tmp_path / "stream"))

@@ -2263,6 +2263,13 @@ class LanceDB(VDB):
 
             if markers is not None and markers.state == "data":
                 data_version = int(markers.recorded_version)
+            elif appending and stats.rows_written == 0:
+                # As the stream path: an append whose rows were all dropped keeps the table version.
+                self.discard_partitions(receipts)
+                existing_table.checkout_latest()
+                data_version = int(existing_table.version)
+                if markers is not None:
+                    markers.mark_data(existing_table, version=data_version, rows=0, digest=stats.digest)
             else:
                 data_version = self._commit_worker_fragments(
                     fragments,
