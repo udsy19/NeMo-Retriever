@@ -85,7 +85,7 @@ def test_worker_write_matches_columnar_stream(tmp_path: Path) -> None:
     assert len(worker_dataset.get_fragments()) == 4
     # Same data-file version as the LanceDB writer, so fragment-written tables scan like stream-written ones.
     stream_dataset = lance.dataset(str(tmp_path / "stream" / "chunks.lance"))
-    assert worker_dataset.data_storage_version == stream_dataset.data_storage_version == "2.1"
+    assert worker_dataset.data_storage_version == stream_dataset.data_storage_version
 
 
 def test_worker_write_overwrite_then_append(tmp_path: Path) -> None:

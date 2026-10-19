@@ -2,10 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -137,7 +139,6 @@ def _local_table_lock(uri: str, table_name: str, *, phase: str) -> AbstractConte
 
 
 # Data-file version LanceDB 0.34's writer emits for its default ``data_storage_version="stable"``.
-_WORKER_WRITE_STORAGE_VERSION = "2.1"
 # Rows per Lance page for fixed-size-list vector columns. Lance flushes a vector page only at the
 # boundary of an Arrow batch, after the page reached its ~8 MiB target, so a batch larger than that
 # becomes one oversized page (``max_rows_per_group``/``max_bytes_per_file`` do not split it). 1024
@@ -887,6 +888,17 @@ class _BatchStreamSource(_StreamSource):
             stats=stats,
             include_digest=include_digest,
         )
+
+
+@functools.lru_cache(maxsize=1)
+def _lancedb_default_storage_version() -> str:
+    """Lance data-file version that this LanceDB release writes for a new table."""
+
+    import lance
+
+    with tempfile.TemporaryDirectory(prefix="nrl-lance-version-") as probe:
+        lancedb.connect(uri=probe).create_table("probe", schema=pa.schema([pa.field("x", pa.int32())]))
+        return str(lance.dataset(os.path.join(probe, "probe.lance")).data_storage_version)
 
 
 class LanceDB(VDB):
@@ -1990,7 +2002,7 @@ class LanceDB(VDB):
 
         Appends reuse the table's version; new/overwritten tables use the version the LanceDB
         writer (``create_table``/``add``) produces, so fragment-written tables scan like
-        stream-written ones. pylance's own default ("stable") is newer than LanceDB's.
+        stream-written ones. That version changes between LanceDB releases, so it is probed.
         """
 
         import lance
@@ -2000,7 +2012,7 @@ class LanceDB(VDB):
                 return str(lance.dataset(self._lance_table_uri()).data_storage_version)
             except ValueError:
                 pass
-        return _WORKER_WRITE_STORAGE_VERSION
+        return _lancedb_default_storage_version()
 
     def write_partition(self, batches: Iterable[CanonicalRecordBatch]) -> dict[str, Any]:
         """Worker side of the worker-native sink: project one partition and write Lance fragments.
