@@ -753,7 +753,7 @@ class RayDataExecutor(AbstractExecutor):
         validate_batch: Callable[[pd.DataFrame], None] | None = None,
         preserve_pandas_blocks: bool = False,
     ) -> pd.DataFrame:
-        """Opt-in worker-native LanceDB sink: Ray tasks project and write Lance fragments; the driver commits once.
+        """Worker-native LanceDB sink: Ray tasks project and write Lance fragments; the driver commits once.
 
         Each task rebuilds the sink operator from ``operator_kwargs`` (as the record path does on
         workers), runs ``_write_partition`` on one bundle of ``worker_write_rows`` rows, and returns a
@@ -829,13 +829,27 @@ class RayDataExecutor(AbstractExecutor):
         )
 
         supports_worker_write = getattr(sink_operator, "_supports_worker_write", None)
-        if not return_results and supports_worker_write is not None and supports_worker_write():
-            return self._worker_write_ingest(
+        if supports_worker_write is not None and supports_worker_write():
+            preserve_pandas_blocks = _requires_stable_pandas_blocks(nodes[:sink_index])
+            if return_results:
+                # The write tasks and the returned rows read the same computed blocks.
+                dataset = dataset.materialize()
+            summary = self._worker_write_ingest(
                 dataset,
                 nodes[sink_index],
                 validate_batch=validate_batch,
-                preserve_pandas_blocks=_requires_stable_pandas_blocks(nodes[:sink_index]),
+                preserve_pandas_blocks=preserve_pandas_blocks,
             )
+            if not return_results:
+                return summary
+            if has_downstream_nodes:
+                downstream = self._build_dataset(
+                    dataset,
+                    segment="after_stream_ingest",
+                    input_preserves_pandas_output=preserve_pandas_blocks,
+                )
+                return ray_dataset_to_pandas(downstream)
+            return ray_dataset_to_pandas(dataset)
 
         terminal_frames: list[pd.DataFrame] = []
         input_rows = 0

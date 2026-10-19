@@ -405,3 +405,32 @@ def test_worker_write_sparse_table_matches_the_stream(tmp_path: Path) -> None:
     assert actual.schema.equals(expected.schema, check_metadata=True)
     assert actual.equals(expected)
     assert actual.num_rows == 5
+
+
+def test_return_results_writes_from_workers_and_returns_the_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nemo_retriever.graph import executor as executor_module
+    from nemo_retriever.graph.executor import RayDataExecutor
+
+    sink = SimpleNamespace(_supports_worker_write=lambda: True)
+    calls: list[str] = []
+    materialized = SimpleNamespace(name="materialized")
+    dataset = SimpleNamespace(materialize=lambda: calls.append("materialize") or materialized)
+    executor = RayDataExecutor.__new__(RayDataExecutor)
+    executor.graph = None
+    monkeypatch.setattr(executor, "_linearize", lambda graph: [SimpleNamespace(operator=sink)])
+    monkeypatch.setattr(executor, "_stream_ingest_index", lambda nodes, require_terminal: 0)
+    monkeypatch.setattr(executor, "_build_dataset", lambda data, segment: dataset)
+    monkeypatch.setattr(executor_module, "_requires_stable_pandas_blocks", lambda nodes: False)
+
+    def worker_write(ds, node, **kwargs):
+        calls.append("write")
+        assert ds is materialized
+        return pd.DataFrame([{"input_rows": 2, "submitted_records": 2}])
+
+    monkeypatch.setattr(executor, "_worker_write_ingest", worker_write)
+    monkeypatch.setattr(executor_module, "ray_dataset_to_pandas", lambda ds: pd.DataFrame({"read": [ds.name]}))
+
+    result = executor._ingest(None, return_results=True)
+
+    assert calls == ["materialize", "write"]
+    assert result["read"].tolist() == ["materialized"]

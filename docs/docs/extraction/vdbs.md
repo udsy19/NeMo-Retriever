@@ -359,8 +359,12 @@ Sparse (full-text only) tables and sidecar metadata use the same worker writes.
 The sidecar file is read once on the driver, and its lookup is sent to the
 write tasks.
 
-The driver streaming path still runs for remote stores and
-`ingest(return_results=True)`.
+`ingest(return_results=True)` also writes from the workers. Ray computes the
+pipeline output once, the workers write it, and the driver then returns the same
+rows.
+
+Remote stores (object storage and LanceDB Cloud) and the service's private table
+schemas still use the driver write path.
 
 `RayDataExecutor.build_dataset()` remains lazy and builds the complete legacy
 graph, including the global VDB stage. In-process and service execution do not
