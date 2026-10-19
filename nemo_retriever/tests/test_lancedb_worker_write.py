@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -214,3 +215,100 @@ def test_worker_write_applies_fail_closed_rules_over_the_whole_upload(tmp_path: 
         _worker_write(_backend(uri, worker_write=True), partial)
     # Fragments may be on disk, but nothing was committed: no manifest exists.
     assert not list((uri / "chunks.lance").glob("_versions/*.manifest"))
+
+
+def _data_files(uri: Path) -> list[Path]:
+    return sorted((uri / "chunks.lance" / "data").glob("*.lance"))
+
+
+def test_worker_write_rows_must_be_positive(tmp_path: Path) -> None:
+    for rows in (0, -1):
+        with pytest.raises(ValueError, match="worker_write_rows"):
+            _backend(tmp_path / "db", worker_write=True, worker_write_rows=rows)
+
+
+def test_rejected_upload_removes_its_fragment_files(tmp_path: Path) -> None:
+    uri = tmp_path / "db"
+    missing = _row(0)
+    missing["embedding"] = None
+    with pytest.raises(VdbUploadError, match="missing embeddings"):
+        _worker_write(_backend(uri, worker_write=True), _frames([_row(1), _row(2), missing], batch_size=2))
+    assert _data_files(uri) == []
+
+
+def test_rejected_append_keeps_committed_files_and_removes_its_own(tmp_path: Path) -> None:
+    uri = tmp_path / "db"
+    first = _backend(uri, worker_write=True, embedding_model_name="model-a")
+    _worker_write(first, _frames([_row(index) for index in range(4)], batch_size=2))
+    committed = _data_files(uri)
+    append = _backend(uri, worker_write=True, overwrite=False, embedding_model_name="another-model")
+    with pytest.raises(ValueError, match="model"):
+        _worker_write(append, _frames([_row(index) for index in range(4, 8)], batch_size=2))
+    assert _data_files(uri) == committed
+    assert _rows(uri).num_rows == 4
+
+
+class _RecordingDataset:
+    """Stands in for a Ray dataset: records ``map_batches`` options and runs the task on pandas frames."""
+
+    def __init__(self, frames: list[pd.DataFrame]) -> None:
+        self.frames = frames
+        self.options: dict = {}
+
+    def map_batches(self, fn, **options):
+        self.options = options
+        outputs = [
+            fn(frame if options["batch_format"] == "pandas" else pa.Table.from_pandas(frame)) for frame in self.frames
+        ]
+        return SimpleNamespace(take_all=lambda: [row for out in outputs for row in out.to_dict("records")])
+
+
+@pytest.mark.parametrize("preserve, batch_format", [(True, "pandas"), (False, "pyarrow")])
+def test_executor_worker_write_batch_format_and_driver_node(tmp_path: Path, preserve: bool, batch_format: str) -> None:
+    ray = pytest.importorskip("ray")
+    from nemo_retriever.graph.executor import RayDataExecutor
+    from nemo_retriever.graph.pipeline_graph import Node
+
+    vdb_kwargs = {"uri": str(tmp_path / "db"), "table_name": "chunks", "vector_dim": DIM, "build_index": False}
+    vdb_kwargs.update(worker_write=True, worker_write_rows=3)
+    node = Node(IngestVdbOperator(vdb_op="lancedb", vdb_kwargs=vdb_kwargs))
+    dataset = _RecordingDataset([pd.DataFrame([_row(index) for index in range(3)])])
+    ray.init(num_cpus=1, include_dashboard=False, ignore_reinit_error=True)
+    try:
+        driver_node = ray.get_runtime_context().get_node_id()
+        result = RayDataExecutor.__new__(RayDataExecutor)._worker_write_ingest(
+            dataset, node, preserve_pandas_blocks=preserve
+        )
+    finally:
+        ray.shutdown()
+    assert dataset.options["batch_format"] == batch_format
+    assert dataset.options["batch_size"] == 3
+    strategy = dataset.options["scheduling_strategy"]
+    assert (strategy.node_id, strategy.soft) == (driver_node, False)
+    assert result["submitted_records"].tolist() == [3]
+
+
+def test_executor_worker_write_keeps_preserved_pandas_blocks(tmp_path: Path) -> None:
+    """End to end on Ray: heterogeneous object rows kept in pandas upstream are written and committed."""
+    ray = pytest.importorskip("ray")
+    from nemo_retriever.graph.executor import RayDataExecutor
+    from nemo_retriever.graph.pipeline_graph import Node
+
+    rows = [_row(index) for index in range(6)]
+    # Mixed scalar/list values in one object column: Arrow cannot hold this column, pandas can.
+    for index, row in enumerate(rows):
+        row["bbox"] = None if index % 2 else [0.0, 1.0, 2.0, 3.0]
+        row["extra"] = index if index % 2 else f"value-{index}"
+    uri = tmp_path / "db"
+    vdb_kwargs = {"uri": str(uri), "table_name": "chunks", "vector_dim": DIM, "build_index": False}
+    vdb_kwargs.update(worker_write=True, worker_write_rows=2)
+    node = Node(IngestVdbOperator(vdb_op="lancedb", vdb_kwargs=vdb_kwargs))
+    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
+    try:
+        dataset = ray.data.from_pandas([pd.DataFrame(rows[:3]), pd.DataFrame(rows[3:])])
+        executor = RayDataExecutor.__new__(RayDataExecutor)
+        result = executor._worker_write_ingest(dataset, node, preserve_pandas_blocks=True)
+    finally:
+        ray.shutdown()
+    assert result["submitted_records"].tolist() == [6]
+    assert _rows(uri)["text"].to_pylist() == [f"chunk {index}" for index in range(6)]

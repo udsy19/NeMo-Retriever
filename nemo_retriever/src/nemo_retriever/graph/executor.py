@@ -751,6 +751,7 @@ class RayDataExecutor(AbstractExecutor):
         sink_node: Node,
         *,
         validate_batch: Callable[[pd.DataFrame], None] | None = None,
+        preserve_pandas_blocks: bool = False,
     ) -> pd.DataFrame:
         """Opt-in worker-native LanceDB sink: Ray tasks project and write Lance fragments; the driver commits once.
 
@@ -758,12 +759,17 @@ class RayDataExecutor(AbstractExecutor):
         workers), runs ``_write_partition`` on one bundle of ``worker_write_rows`` rows, and returns a
         one-row receipt frame. Receipts are the only data that crosses to the driver. ``validate_batch``
         runs inside the task before the write, so a stage error surfaces as a ``RayTaskError`` wrapping it.
+        Blocks that upstream stages deliberately keep in pandas are handed over as pandas, not re-encoded
+        as Arrow. Write tasks run on the driver's node, where the commit reads the fragments back.
         """
-        operator_class, operator_kwargs = sink_node.operator_class, sink_node.operator_kwargs
-        rows_per_task = int(getattr(sink_node.operator._vdb, "worker_write_rows", 0)) or None
+        import ray
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-        def write_partition(block: pa.Table) -> pd.DataFrame:
-            frame = arrow_table_to_pandas(block)
+        operator_class, operator_kwargs = sink_node.operator_class, sink_node.operator_kwargs
+        rows_per_task = int(sink_node.operator._vdb.worker_write_rows)
+
+        def write_partition(block: pa.Table | pd.DataFrame) -> pd.DataFrame:
+            frame = block if isinstance(block, pd.DataFrame) else arrow_table_to_pandas(block)
             if validate_batch is not None:
                 validate_batch(frame)
             receipt = operator_class(**operator_kwargs)._write_partition(frame)
@@ -774,9 +780,12 @@ class RayDataExecutor(AbstractExecutor):
 
         receipt_rows = dataset.map_batches(
             write_partition,
-            batch_format="pyarrow",
+            batch_format="pandas" if preserve_pandas_blocks else "pyarrow",
             batch_size=rows_per_task,
             zero_copy_batch=True,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=ray.get_runtime_context().get_node_id(), soft=False
+            ),
         ).take_all()
         receipts = [
             {**row, "fragments": json.loads(row["fragments"]), "conversion": json.loads(row["conversion"])}
@@ -810,7 +819,12 @@ class RayDataExecutor(AbstractExecutor):
 
         supports_worker_write = getattr(sink_operator, "_supports_worker_write", None)
         if not return_results and supports_worker_write is not None and supports_worker_write():
-            return self._worker_write_ingest(dataset, nodes[sink_index], validate_batch=validate_batch)
+            return self._worker_write_ingest(
+                dataset,
+                nodes[sink_index],
+                validate_batch=validate_batch,
+                preserve_pandas_blocks=_requires_stable_pandas_blocks(nodes[:sink_index]),
+            )
 
         terminal_frames: list[pd.DataFrame] = []
         input_rows = 0

@@ -271,7 +271,11 @@ class IngestVdbOperator(AbstractOperator):
         tally = ConversionTally(embedding_column=self._embedding_column)
         for receipt in receipts:
             tally.absorb(receipt["conversion"])
-        tally.finish()
+        try:
+            tally.finish()
+        except Exception:
+            self._vdb.discard_partitions(receipts)
+            raise
         self._vdb.commit_partitions(receipts)
         return sum(int(receipt["submitted_records"]) for receipt in receipts)
 

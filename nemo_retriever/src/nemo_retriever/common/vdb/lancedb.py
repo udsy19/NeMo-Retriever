@@ -971,6 +971,8 @@ class LanceDB(VDB):
         # Dense local tables only; ``worker_write_rows`` bounds rows per write task.
         self.worker_write = bool(worker_write)
         self.worker_write_rows = int(worker_write_rows)
+        if self.worker_write_rows < 1:
+            raise ValueError(f"worker_write_rows must be a positive integer, got {worker_write_rows!r}")
         if self.worker_write and not self.supports_stream_ingest_batches:
             raise ValueError("worker_write=True requires a dense (non-sparse) local LanceDB table")
         if self.worker_write and self.stream_operation_id is not None:
@@ -2055,6 +2057,23 @@ class LanceDB(VDB):
         )
         return receipt
 
+    def discard_partitions(self, receipts: Iterable[dict[str, Any]]) -> None:
+        """Delete the data files that ``write_partition`` wrote for receipts that will never be committed.
+
+        Only files named in these receipts are removed, so a rejected upload leaves no orphaned
+        fragments behind and committed table data is never touched.
+        """
+
+        data_dir = Path(self._lance_table_uri()) / "data"
+        for receipt in receipts:
+            for encoded in receipt.get("fragments") or ():
+                fragment = json.loads(encoded) if isinstance(encoded, str) else encoded
+                for data_file in fragment.get("files") or ():
+                    try:
+                        (data_dir / data_file["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Could not remove uncommitted Lance data file %s", data_file["path"])
+
     def commit_partitions(self, receipts: Iterable[dict[str, Any]]) -> None:
         """Driver side of the worker-native sink: one Lance commit, then the stream path's finalize.
 
@@ -2064,6 +2083,18 @@ class LanceDB(VDB):
         drop counts are tallied per partition instead of one end-of-stream log line.
         """
 
+        receipts = list(receipts)
+        progress = {"commit_attempted": False}
+        try:
+            self._commit_worker_partitions(receipts, progress)
+        except Exception:
+            # Before the commit nothing references the fragments, so a rejected upload removes them.
+            # Once the commit was attempted, the files may belong to a table version: keep them.
+            if not progress["commit_attempted"]:
+                self.discard_partitions(receipts)
+            raise
+
+    def _commit_worker_partitions(self, receipts: list[dict[str, Any]], progress: dict[str, bool]) -> None:
         import lance
         from lance.fragment import FragmentMetadata
 
@@ -2121,6 +2152,7 @@ class LanceDB(VDB):
             else:
                 operation = lance.LanceOperation.Overwrite(schema, fragments)
                 expected_rows = stats.rows_written
+            progress["commit_attempted"] = True
             dataset = lance.LanceDataset.commit(self._lance_table_uri(), operation, read_version=base_version)
             data_version = int(dataset.version)
             try:
