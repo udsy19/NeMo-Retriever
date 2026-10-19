@@ -2069,7 +2069,29 @@ class LanceDB(VDB):
         return self._write_partition_source(_BatchStreamSource(self, batches))
 
     def write_partition_records(self, records: Iterable[dict[str, Any]]) -> dict[str, Any]:
-        """``write_partition`` for canonical record dictionaries, as ``stream_ingest`` takes them (sparse tables)."""
+        """Write one partition of canonical record dictionaries as Lance fragments (worker side, sparse tables).
+
+        ``write_partition`` for the record form that ``stream_ingest`` takes. Nothing is committed: the
+        caller passes the receipt to ``commit_partitions`` on the driver, or to ``discard_partitions``.
+
+        Parameters
+        ----------
+        records
+            Canonical NRL records for this partition, in the shape ``stream_ingest`` accepts.
+
+        Returns
+        -------
+        dict
+            JSON-safe receipt: written fragment metadata and the row counts and row hashes
+            ``commit_partitions`` aggregates.
+
+        Raises
+        ------
+        ValueError
+            A record does not match this table's schema (for example, a vector of the wrong width).
+        OSError
+            Lance cannot write the fragment files under the table path.
+        """
 
         return self._write_partition_source(_RecordStreamSource(self, records))
 
