@@ -350,8 +350,13 @@ fragments from the local table path. If the upload is rejected before the commit
 for example because searchable rows have no embeddings, the fragment files that
 the write tasks created are deleted.
 
-The driver streaming path still runs with `stream_operation_id`, sidecar
-metadata, sparse tables, remote stores, and `ingest(return_results=True)`.
+With `stream_operation_id`, the commit records the same durable markers as the
+streaming path. The digest combines row hashes from every write task, so it does
+not depend on how Ray partitions the rows. A retry that finds the operation
+already committed deletes its own fragments instead of appending them again.
+
+The driver streaming path still runs with sidecar metadata, sparse tables,
+remote stores, and `ingest(return_results=True)`.
 
 `RayDataExecutor.build_dataset()` remains lazy and builds the complete legacy
 graph, including the global VDB stage. In-process and service execution do not

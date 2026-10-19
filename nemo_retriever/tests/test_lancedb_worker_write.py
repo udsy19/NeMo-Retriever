@@ -18,6 +18,7 @@ lancedb = pytest.importorskip("lancedb", minversion="0.34.0")
 lance = pytest.importorskip("lance")
 
 from nemo_retriever.common.vdb._lancedb_stream import DataCommittedFinalizationError
+from nemo_retriever.common.vdb._lancedb_stream_state import VdbOperationConflict
 from nemo_retriever.common.vdb.lancedb import LanceDB
 from nemo_retriever.common.vdb.records import VdbUploadError
 from nemo_retriever.graph.executor import arrow_table_to_pandas
@@ -108,7 +109,7 @@ def test_worker_write_without_partitions_creates_no_table(tmp_path: Path) -> Non
 def test_worker_write_is_the_default_for_dense_local_tables(tmp_path: Path) -> None:
     assert _backend(tmp_path / "db").supports_worker_write
     assert not _backend(tmp_path / "db", sparse=True).supports_worker_write
-    assert not _backend(tmp_path / "db", stream_operation_id="job-1").supports_worker_write
+    assert _backend(tmp_path / "db", stream_operation_id="job-1").supports_worker_write
 
 
 def _vector_pages(uri: Path) -> list[tuple[int, int]]:
@@ -323,3 +324,36 @@ def test_executor_removes_finished_fragments_when_a_write_task_fails(
     with pytest.raises(RuntimeError, match="write task failed"):
         RayDataExecutor.__new__(RayDataExecutor)._worker_write_ingest(dataset, node)
     assert not list((uri / "chunks.lance" / "data").glob("*"))
+
+
+def test_worker_write_operation_id_retry_does_not_append_again(tmp_path: Path) -> None:
+    uri = tmp_path / "db"
+    rows = [_row(index) for index in range(6)]
+    assert _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-1"), _frames(rows, batch_size=2)) == 6
+    committed = _data_files(uri)
+    # Different partitioning, same rows: the digest is order- and partition-independent.
+    _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-1"), _frames(rows[::-1], batch_size=4))
+    assert _rows(uri).num_rows == 6
+    assert _data_files(uri) == committed
+
+
+def test_worker_write_operation_id_rejects_different_rows(tmp_path: Path) -> None:
+    uri = tmp_path / "db"
+    _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-1"), _frames([_row(1)], batch_size=1))
+    committed = _data_files(uri)
+    with pytest.raises(VdbOperationConflict):
+        _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-1"), _frames([_row(2)], batch_size=1))
+    assert _data_files(uri) == committed
+
+
+def test_worker_write_operation_id_resumes_after_finalization_failure(tmp_path: Path, monkeypatch) -> None:
+    uri = tmp_path / "db"
+    _worker_write(_backend(uri, overwrite=False), _frames([_row(100)], batch_size=1))
+    frames = _frames([_row(index) for index in range(4)], batch_size=2)
+    original = LanceDB._finalize_stream_write
+    monkeypatch.setattr(LanceDB, "_finalize_stream_write", lambda self, **kwargs: (_ for _ in ()).throw(OSError("x")))
+    with pytest.raises(DataCommittedFinalizationError):
+        _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-2"), frames)
+    monkeypatch.setattr(LanceDB, "_finalize_stream_write", original)
+    _worker_write(_backend(uri, overwrite=False, stream_operation_id="job-2"), frames)
+    assert _rows(uri).num_rows == 5
